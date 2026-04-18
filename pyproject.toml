@@ -1,0 +1,27 @@
+[project]
+name = "adk-csm-live"
+version = "0.1.0"
+description = "Bidi-streaming voice agent: Gemini Live (half-cascade) + Sesame CSM TTS"
+requires-python = ">=3.10"
+dependencies = [
+    "demucs>=4.0.1",
+    "fastapi>=0.136.0",
+    "google-adk>=1.31.0",
+    "google-cloud-aiplatform>=1.148.0",
+    "python-dotenv>=1.2.2",
+    "torchcodec>=0.11.1",
+    "uvicorn[standard]>=0.44.0",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "numpy>=2.2.6",
+    "soundfile>=0.13.1",
+    "yt-dlp>=2026.3.17",
+]
+
+[project.scripts]
+serve = "uvicorn app.main:app --reload --app-dir ."
