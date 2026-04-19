@@ -1,22 +1,26 @@
-"""FastAPI server: real-time voice agent pipeline.
+"""FastAPI server: bidi-streaming voice agent pipeline.
 
-WebSocket flow:
-  1. Browser streams raw 16kHz PCM from the microphone.
-  2. RMS-based VAD detects end of speech and flushes the buffer.
-  3. Gemini Flash transcribes the audio chunk to text.
-  4. ADK agent (Gemini Flash) generates a text response.
-  5. OmniVoice (Vertex AI) synthesises the response to WAV.
-  6. WAV bytes are sent back to the browser over the WebSocket.
+WebSocket bidi flow (no Gemini Live API required):
+  1. Browser AudioWorklet streams raw 16kHz Int16 PCM continuously.
+  2. Server VAD buffers chunks; silence after speech triggers an utterance.
+  3. Utterance PCM is sent to gemini-2.5-flash via run_async().
+  4. Streaming ADK events are forwarded to the browser as they arrive.
+  5. Agent text is split at sentence boundaries and queued for CSM TTS.
+  6. PCM audio chunks are forwarded to the browser as they complete.
 
 REST endpoints support text chat via SSE for non-live agents.
 """
 
 import asyncio
 import base64
+import io
 import json
 import logging
+import re
+import struct
 import uuid
 import warnings
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +35,7 @@ from pydantic import BaseModel
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from app.csm_agent import agent
+from app.csm_agent.agent import agent, create_agent
 from app.csm_tts import synthesize
 
 logging.basicConfig(
@@ -51,6 +55,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 session_service = InMemorySessionService()
+runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_service)
+
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
+
+# VAD tuning
+_VAD_SAMPLE_RATE = 16000
+_VAD_ENERGY_THRESHOLD = 600      # Int16 RMS; below = silence
+_VAD_SILENCE_MS = 700            # ms of silence that closes an utterance
+_VAD_MIN_SPEECH_MS = 150         # ignore clips shorter than this
+_VAD_SILENCE_BYTES = int(_VAD_SILENCE_MS * _VAD_SAMPLE_RATE / 1000) * 2
+_VAD_MIN_BYTES = int(_VAD_MIN_SPEECH_MS * _VAD_SAMPLE_RATE / 1000) * 2
+
+
+def _rms(pcm_bytes: bytes) -> float:
+    count = len(pcm_bytes) // 2
+    if count == 0:
+        return 0.0
+    samples = struct.unpack_from(f"<{count}h", pcm_bytes)
+    return (sum(s * s for s in samples) / count) ** 0.5
+
+
+def _split_sentences(text: str) -> tuple[list[str], str]:
+    parts = _SENTENCE_BOUNDARY.split(text)
+    if len(parts) <= 1:
+        return [], text
+    return parts[:-1], parts[-1]
 
 
 @app.get("/list-apps")
@@ -110,7 +140,6 @@ async def run_sse(request: RunRequest) -> StreamingResponse:
             data = event.model_dump(exclude_none=True, by_alias=True)
             yield f"data: {json.dumps(data)}\n\n"
 
-            # Synthesize TTS on completed agent turns.
             parts_data = (
                 data.get("content", {}).get("parts", [])
                 if isinstance(data.get("content"), dict) else []
@@ -127,56 +156,6 @@ async def run_sse(request: RunRequest) -> StreamingResponse:
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
-runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_service)
-
-
-import io
-import struct
-import wave as wave_module
-
-import google.genai as genai
-
-_genai_client = None
-
-def _get_genai_client():
-    global _genai_client
-    if _genai_client is None:
-        import os
-        _genai_client = genai.Client(
-            vertexai=True,
-            project=os.environ["GOOGLE_CLOUD_PROJECT"],
-            location=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
-        )
-    return _genai_client
-
-
-def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 16000) -> bytes:
-    buf = io.BytesIO()
-    with wave_module.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_bytes)
-    return buf.getvalue()
-
-
-async def _transcribe(pcm_bytes: bytes) -> str:
-    wav_bytes = _pcm_to_wav(pcm_bytes)
-    client = _get_genai_client()
-    loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                types.Part(
-                    inline_data=types.Blob(mime_type="audio/wav", data=wav_bytes)
-                ),
-                types.Part(text="Transcribe the speech in this audio. Reply with only the transcript, nothing else."),
-            ],
-        ),
-    )
-    return response.text.strip()
 
 
 @app.websocket("/ws/{user_id}/{session_id}")
@@ -196,55 +175,132 @@ async def websocket_endpoint(
             app_name=APP_NAME, user_id=user_id, session_id=session_id
         )
 
-    SAMPLE_RATE = 16000
-    BYTES_PER_SAMPLE = 2
-    SILENCE_THRESHOLD = 300        # RMS below this = silence
-    SILENCE_DURATION = 0.8         # seconds of silence before flush
-    MIN_SPEECH_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE * 0.3  # min 0.3s of speech
+    ws_agent = create_agent()
+    ws_runner = Runner(app_name=APP_NAME, agent=ws_agent, session_service=session_service)
+    logger.debug("Model: %s", ws_agent.model)
 
-    SILENCE_SAMPLES = int(SAMPLE_RATE * SILENCE_DURATION)
-    silent_samples = 0
+    # Queue of Content objects to process sequentially.
+    msg_queue: asyncio.Queue[types.Content | None] = asyncio.Queue()
+
+    # ── VAD state ─────────────────────────────────────────────────────────────
+
+    audio_buf = bytearray()
+    silence_bytes = 0
     has_speech = False
-    pcm_buffer = bytearray()
 
-    def rms(chunk: bytes) -> float:
-        samples = struct.unpack_from(f"<{len(chunk)//2}h", chunk)
-        return (sum(s * s for s in samples) / len(samples)) ** 0.5
+    def vad_feed(chunk: bytes) -> types.Content | None:
+        """Feed a PCM chunk; returns a Content when an utterance is complete."""
+        nonlocal audio_buf, silence_bytes, has_speech
 
-    async def handle_audio(pcm: bytes) -> None:
-        transcript = await _transcribe(pcm)
-        if not transcript:
-            return
-        logger.debug("Transcript: %r", transcript[:80])
-        await websocket.send_text(json.dumps({"type": "transcript", "text": transcript}))
-        await run_agent(transcript)
+        energy = _rms(chunk)
 
-    async def run_agent(text: str) -> None:
-        message = types.Content(role="user", parts=[types.Part(text=text)])
-        text_buffer = ""
-        async for event in runner.run_async(
-            user_id=user_id,
-            session_id=session_id,
-            new_message=message,
-        ):
-            event_dict = event.model_dump(exclude_none=True, by_alias=True)
-            await websocket.send_text(json.dumps(event_dict))
+        if energy > _VAD_ENERGY_THRESHOLD:
+            has_speech = True
+            silence_bytes = 0
+            audio_buf.extend(chunk)
+            return None
 
-            parts = (
-                event_dict.get("content", {}).get("parts", [])
-                if isinstance(event_dict.get("content"), dict) else []
-            )
-            for part in parts:
-                if isinstance(part.get("text"), str):
-                    text_buffer += part["text"]
+        if has_speech:
+            audio_buf.extend(chunk)
+            silence_bytes += len(chunk)
+            if silence_bytes >= _VAD_SILENCE_BYTES:
+                pcm = bytes(audio_buf)
+                audio_buf.clear()
+                silence_bytes = 0
+                has_speech = False
+                if len(pcm) < _VAD_MIN_BYTES:
+                    return None
+                wav_buf = io.BytesIO()
+                with wave.open(wav_buf, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(_VAD_SAMPLE_RATE)
+                    wf.writeframes(pcm)
+                return types.Content(role="user", parts=[
+                    types.Part(inline_data=types.Blob(
+                        mime_type="audio/wav",
+                        data=wav_buf.getvalue(),
+                    ))
+                ])
 
-        if text_buffer.strip():
-            logger.debug("Synthesizing: %r", text_buffer[:80])
+        return None
+
+    # ── Message handler ────────────────────────────────────────────────────────
+
+    async def handle_message(content: types.Content) -> None:
+        tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        buffer = ""
+
+        async def tts_task() -> None:
+            while True:
+                text = await tts_queue.get()
+                if text is None:
+                    break
+                try:
+                    wav_bytes = await synthesize(text)
+                    with wave.open(io.BytesIO(wav_bytes)) as wf:
+                        sample_rate = wf.getframerate()
+                        pcm = wf.readframes(wf.getnframes())
+                    await websocket.send_text(json.dumps({
+                        "content": {
+                            "parts": [{
+                                "inlineData": {
+                                    "mimeType": f"audio/pcm;rate={sample_rate}",
+                                    "data": base64.b64encode(pcm).decode(),
+                                }
+                            }]
+                        }
+                    }))
+                except Exception as exc:
+                    logger.error("CSM synthesis failed: %s", exc)
+
+        tts = asyncio.create_task(tts_task())
+
+        try:
+            async for event in ws_runner.run_async(
+                user_id=user_id,
+                session_id=session_id,
+                new_message=content,
+            ):
+                event_json = event.model_dump_json(exclude_none=True, by_alias=True)
+                await websocket.send_text(event_json)
+
+                if event.author != "user":
+                    event_dict = json.loads(event_json)
+                    content_data = event_dict.get("content")
+                    if isinstance(content_data, dict):
+                        for part in content_data.get("parts", []):
+                            if isinstance(part, dict) and (t := part.get("text", "")):
+                                buffer += t
+                                sentences, buffer = _split_sentences(buffer)
+                                for s in sentences:
+                                    if s.strip():
+                                        await tts_queue.put(s.strip())
+
+                    if not event_dict.get("partial", True) and buffer.strip():
+                        await tts_queue.put(buffer.strip())
+                        buffer = ""
+        finally:
+            if buffer.strip():
+                await tts_queue.put(buffer.strip())
+            await tts_queue.put(None)
+            await tts
+
+    # ── Process loop (sequential) ──────────────────────────────────────────────
+
+    async def process_loop() -> None:
+        while True:
+            content = await msg_queue.get()
+            if content is None:
+                break
             try:
-                audio_bytes = await synthesize(text_buffer.strip())
-                await websocket.send_bytes(audio_bytes)
+                await handle_message(content)
             except Exception as exc:
-                logger.error("CSM synthesis failed: %s", exc)
+                logger.error("handle_message error: %s", exc, exc_info=True)
+
+    processor = asyncio.create_task(process_loop())
+
+    # ── Receive loop ───────────────────────────────────────────────────────────
 
     try:
         while True:
@@ -252,38 +308,33 @@ async def websocket_endpoint(
 
             if "bytes" in message:
                 chunk = message["bytes"]
-                pcm_buffer.extend(chunk)
-
-                energy = rms(chunk)
-                num_samples = len(chunk) // BYTES_PER_SAMPLE
-
-                if energy >= SILENCE_THRESHOLD:
-                    has_speech = True
-                    silent_samples = 0
-                else:
-                    if has_speech:
-                        silent_samples += num_samples
-                        if silent_samples >= SILENCE_SAMPLES and len(pcm_buffer) >= MIN_SPEECH_BYTES:
-                            pcm_chunk = bytes(pcm_buffer)
-                            pcm_buffer.clear()
-                            silent_samples = 0
-                            has_speech = False
-                            asyncio.create_task(handle_audio(pcm_chunk))
+                rms = _rms(chunk)
+                if rms > 50:  # log any non-trivial audio
+                    logger.debug("PCM chunk: %d bytes, RMS=%.1f", len(chunk), rms)
+                utterance = vad_feed(chunk)
+                if utterance:
+                    logger.debug("VAD: utterance detected (%d bytes)", len(utterance.parts[0].inline_data.data))
+                    await msg_queue.put(utterance)
 
             elif "text" in message:
                 payload = json.loads(message["text"])
                 if payload.get("type") == "text":
-                    await run_agent(payload["text"])
-                elif payload.get("type") == "flush":
-                    if pcm_buffer:
-                        pcm_chunk = bytes(pcm_buffer)
-                        pcm_buffer.clear()
-                        asyncio.create_task(handle_audio(pcm_chunk))
+                    await msg_queue.put(types.Content(role="user", parts=[
+                        types.Part(text=payload["text"])
+                    ]))
                 elif payload.get("type") == "image":
-                    image_bytes = base64.b64decode(payload["data"])
-                    await run_agent(f"[Image received: {payload.get('mimeType', 'image/jpeg')}]")
+                    await msg_queue.put(types.Content(role="user", parts=[
+                        types.Part(inline_data=types.Blob(
+                            mime_type=payload.get("mimeType", "image/jpeg"),
+                            data=base64.b64decode(payload["data"]),
+                        ))
+                    ]))
 
     except WebSocketDisconnect:
-        logger.debug("Client disconnected")
+        logger.debug("Client disconnected: user=%s session=%s", user_id, session_id)
     except Exception as exc:
-        logger.error("Streaming error: %s", exc, exc_info=True)
+        logger.error("WebSocket error: %s", exc, exc_info=True)
+    finally:
+        await msg_queue.put(None)
+        await processor
+        logger.debug("WebSocket closed: user=%s session=%s", user_id, session_id)

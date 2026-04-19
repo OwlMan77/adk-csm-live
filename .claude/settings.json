@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/jeanm/AppData/Local/Temp/claude/c--Users-jeanm-dev-claude-projects-adk-csm-live/bb6ecacc-1165-4bf3-99ab-3abbb0a1792a/tasks/**)",
+      "Bash(pip show *)",
+      "Bash(python -c \"import google.adk; print\\(dir\\(google.adk\\)\\)\")",
+      "Bash(python -c \"from google.adk.agents.live_request_queue import LiveRequestQueue; print\\('LiveRequestQueue OK'\\)\")",
+      "Bash(python -c \"from google.adk.runners import Runner; import inspect; methods = [m for m in dir\\(Runner\\) if 'live' in m.lower\\(\\)]; print\\('live methods:', methods\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
