@@ -57,12 +57,12 @@ app.add_middleware(
 session_service = InMemorySessionService()
 runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_service)
 
-_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|(?<=,)\s+|(?<=;)\s+")
 
 # VAD tuning
 _VAD_SAMPLE_RATE = 16000
 _VAD_ENERGY_THRESHOLD = 600      # Int16 RMS; below = silence
-_VAD_SILENCE_MS = 700            # ms of silence that closes an utterance
+_VAD_SILENCE_MS = 800            # ms of silence that closes an utterance
 _VAD_MIN_SPEECH_MS = 150         # ignore clips shorter than this
 _VAD_SILENCE_BYTES = int(_VAD_SILENCE_MS * _VAD_SAMPLE_RATE / 1000) * 2
 _VAD_MIN_BYTES = int(_VAD_MIN_SPEECH_MS * _VAD_SAMPLE_RATE / 1000) * 2
@@ -231,28 +231,45 @@ async def websocket_endpoint(
         tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
         buffer = ""
 
-        async def tts_task() -> None:
+        # Pipeline: futures are created immediately as sentences arrive so
+        # synthesis for sentence N+1 overlaps with sending sentence N.
+        fut_queue: asyncio.Queue[asyncio.Future[bytes] | None] = asyncio.Queue()
+
+        async def tts_producer() -> None:
             while True:
                 text = await tts_queue.get()
                 if text is None:
+                    await fut_queue.put(None)
                     break
-                try:
-                    wav_bytes = await synthesize(text)
-                    with wave.open(io.BytesIO(wav_bytes)) as wf:
-                        sample_rate = wf.getframerate()
-                        pcm = wf.readframes(wf.getnframes())
-                    await websocket.send_text(json.dumps({
-                        "content": {
-                            "parts": [{
-                                "inlineData": {
-                                    "mimeType": f"audio/pcm;rate={sample_rate}",
-                                    "data": base64.b64encode(pcm).decode(),
-                                }
-                            }]
-                        }
-                    }))
-                except Exception as exc:
-                    logger.error("CSM synthesis failed: %s", exc)
+                fut = asyncio.ensure_future(synthesize(text))
+                await fut_queue.put(fut)
+
+        async def tts_task() -> None:
+            producer = asyncio.create_task(tts_producer())
+            try:
+                while True:
+                    item = await fut_queue.get()
+                    if item is None:
+                        break
+                    try:
+                        wav_bytes = await item
+                        with wave.open(io.BytesIO(wav_bytes)) as wf:
+                            sample_rate = wf.getframerate()
+                            pcm = wf.readframes(wf.getnframes())
+                        await websocket.send_text(json.dumps({
+                            "content": {
+                                "parts": [{
+                                    "inlineData": {
+                                        "mimeType": f"audio/pcm;rate={sample_rate}",
+                                        "data": base64.b64encode(pcm).decode(),
+                                    }
+                                }]
+                            }
+                        }))
+                    except Exception as exc:
+                        logger.error("CSM synthesis failed: %s", exc)
+            finally:
+                await producer
 
         tts = asyncio.create_task(tts_task())
 
@@ -263,7 +280,10 @@ async def websocket_endpoint(
                 new_message=content,
             ):
                 event_json = event.model_dump_json(exclude_none=True, by_alias=True)
-                await websocket.send_text(event_json)
+                try:
+                    await websocket.send_text(event_json)
+                except RuntimeError:
+                    break
 
                 if event.author != "user":
                     event_dict = json.loads(event_json)

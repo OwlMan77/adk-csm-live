@@ -30,7 +30,7 @@ def _get_endpoint() -> aiplatform.Endpoint:
 async def synthesize(text: str) -> bytes:
     """Synthesize text via OmniVoice and return WAV bytes."""
     endpoint = _get_endpoint()
-    instances = [{"text": text, "steps": 16 }]
+    instances = [{"text": text, "decoding_steps": 8}]
 
     loop = asyncio.get_running_loop()
     response = await loop.run_in_executor(

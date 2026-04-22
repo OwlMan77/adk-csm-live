@@ -1,0 +1,55 @@
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/app/hf_cache \
+    PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=5
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common curl \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev \
+        libsndfile1 ffmpeg git gcc \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
+    && ln -sf python3.12 /usr/bin/python3 \
+    && ln -sf python3.12 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Let omnivoice-triton resolve torch/torchvision/triton versions freely.
+RUN pip install --no-cache-dir \
+    "omnivoice-triton @ git+https://github.com/newgrit1004/omnivoice-triton.git" \
+    soundfile \
+    fastapi \
+    "uvicorn[standard]" \
+    "huggingface_hub[hf_transfer]" \
+    && pip cache purge
+
+# torchvision 0.21+ has an import-order bug in _meta_registrations.py: it calls
+# torch.library.register_fake("torchvision::nms") before torchvision._C is loaded,
+# so the operator doesn't exist yet and raises RuntimeError. Patch the module to
+# swallow that error silently — audio inference never calls these vision ops.
+RUN python3 -c "\
+import glob, os;\
+header = 'import torch as _torch\n_orig_register_fake = _torch.library.register_fake\ndef _safe_register_fake(op, fn=None, /, *, lib=None, _stacklevel=1):\n    try:\n        return _orig_register_fake(op, fn, lib=lib, _stacklevel=_stacklevel+1)\n    except RuntimeError:\n        return (lambda f: f) if fn is None else fn\n_torch.library.register_fake = _safe_register_fake\n\n';\
+[\
+    (open(f, 'w').write(header + open(f).read()) or print('Patched:', f))\
+    for f in glob.glob('/usr/local/lib/python3*/dist-packages/torchvision/_meta_registrations.py')\
+    if '_safe_register_fake' not in open(f).read()\
+]"
+
+ENV CC=/usr/bin/gcc \
+    HF_HUB_ENABLE_HF_TRANSFER=1
+
+ARG HF_TOKEN
+ENV HF_TOKEN=${HF_TOKEN}
+
+COPY scripts/samples /app/samples
+
+COPY vertex/server_triton.py server.py
+
+EXPOSE 8080
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
