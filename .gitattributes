@@ -1,0 +1,16 @@
+# Line endings are not cosmetic here.
+#
+# qwen/entrypoint.sh is COPYed into a Linux image and run as its ENTRYPOINT. A
+# CRLF checkout on Windows turns the shebang into `/usr/bin/env bash\r`, and the
+# container dies with "no such file or directory" naming a file that plainly
+# exists -- one of the least helpful errors in the business. The deploy scripts
+# have the same problem when run under Git Bash.
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+*.py            text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+
+# Reference voice clips. Never touch these.
+*.wav           binary

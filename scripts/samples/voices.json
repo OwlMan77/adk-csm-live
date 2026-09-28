@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "Which reference clip carries which mood. Qwen3-TTS-Base has no `instruct`",
+    "parameter — that belongs to the CustomVoice and VoiceDesign checkpoints,",
+    "neither of which clones — so on the cloning path the reference clip IS the",
+    "emotion control. One precomputed voice profile is built per entry below and",
+    "baked into the serving image; at request time the mood picks the voice name.",
+    "",
+    "The assignments here are a first guess from the transcripts. Correct them by",
+    "ear: run scripts/bench_tts.py --ab, listen, and edit this file. Nothing else",
+    "needs to change — the precompute script and the server both read it."
+  ],
+  "default": "neutral",
+  "voices": {
+    "neutral": {
+      "clip": "audio1",
+      "why": "Measured and level. The longest clip, so the richest in-context prompt."
+    },
+    "concerned": {
+      "clip": "audio2",
+      "why": "Frightened and confiding — the closest thing here to worry."
+    },
+    "urgent": {
+      "clip": "audio3",
+      "why": "Pressed for time, clipped delivery."
+    },
+    "amused": {
+      "clip": "audio4",
+      "why": "Playful, teasing, a smile audible in it."
+    },
+    "warm": {
+      "clip": "audio4",
+      "why": "Same clip as amused until a warmer reference is recorded."
+    }
+  }
+}
