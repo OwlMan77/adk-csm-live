@@ -1,6 +1,6 @@
 """Vertex AI custom prediction server for k2-fsa/OmniVoice.
 
-Endpoint contract (matches existing csm_tts.py client):
+Endpoint contract (matches the app/tts/omnivoice.py client):
   POST /predict
     request:  {"instances": [{"text": "...", ...}, ...]}
     response: {"predictions": [{"audio": "<base64-wav>"}, ...]}
@@ -39,6 +39,14 @@ SAMPLES_DIR = Path(os.environ.get("SAMPLES_DIR", "/app/samples"))
 _model = None
 _ref_audio_path: str = ""
 _ref_text: str = ""
+# Encoding the reference voice runs HuBERT + DAC + RVQ. It does not depend on
+# the text, so it is done once at startup and reused for every request.
+_clone_prompt: Any = None
+_sample_rate: int = 24000
+
+# 32 is the library default and 4x slower than it needs to be for a live call.
+# 16 is the documented fast setting.
+DEFAULT_NUM_STEP = int(os.environ.get("OMNIVOICE_NUM_STEP", "16"))
 
 
 def _pick_reference() -> tuple[str, str]:
@@ -60,7 +68,7 @@ def _pick_reference() -> tuple[str, str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model, _ref_audio_path, _ref_text
+    global _model, _ref_audio_path, _ref_text, _clone_prompt, _sample_rate
 
     logger.info("Loading OmniVoice on %s …", DEVICE)
     from omnivoice import OmniVoice
@@ -71,7 +79,22 @@ async def lifespan(app: FastAPI):
         dtype=torch.float16,
     )
     _ref_audio_path, _ref_text = _pick_reference()
-    logger.info("OmniVoice ready. Reference: %s", _ref_audio_path or "none")
+    _sample_rate = int(getattr(_model, "sampling_rate", 24000))
+
+    if _ref_audio_path:
+        # preprocess_prompt trims silence; skip it when we supply the transcript
+        # ourselves, or the trim and the transcript can disagree.
+        _clone_prompt = _model.create_voice_clone_prompt(
+            ref_audio=_ref_audio_path,
+            ref_text=_ref_text,
+            preprocess_prompt=False,
+        )
+        logger.info("Reference voice encoded once at startup.")
+
+    logger.info(
+        "OmniVoice ready. Reference: %s | %d Hz | num_step=%d",
+        _ref_audio_path or "none", _sample_rate, DEFAULT_NUM_STEP,
+    )
     yield
 
 
@@ -83,7 +106,7 @@ class PredictRequest(BaseModel):
     parameters: dict[str, Any] = {}
 
 
-def _ndarray_to_b64_wav(audio: np.ndarray, sample_rate: int = 24000) -> str:
+def _ndarray_to_b64_wav(audio: np.ndarray, sample_rate: int) -> str:
     buf = io.BytesIO()
     sf.write(buf, audio, sample_rate, format="WAV", subtype="PCM_16")
     return base64.b64encode(buf.getvalue()).decode()
@@ -93,7 +116,7 @@ def _synthesize_one(
     text: str,
     override_audio_b64: str = "",
     override_ref_text: str = "",
-    num_step: int = 32,
+    num_step: int = DEFAULT_NUM_STEP,
     speed: float = 1.0,
     duration: float | None = None,
 ) -> str:
@@ -107,6 +130,7 @@ def _synthesize_one(
         kwargs["duration"] = duration
 
     if override_audio_b64 and override_ref_text:
+        # A per-request voice has to be encoded here; only the baked-in one is cached.
         audio_bytes = base64.b64decode(override_audio_b64)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
@@ -117,6 +141,9 @@ def _synthesize_one(
             arrays = _model.generate(**kwargs)
         finally:
             Path(tmp_path).unlink(missing_ok=True)
+    elif _clone_prompt is not None:
+        kwargs["voice_clone_prompt"] = _clone_prompt
+        arrays = _model.generate(**kwargs)
     elif _ref_audio_path:
         kwargs["ref_audio"] = _ref_audio_path
         kwargs["ref_text"] = _ref_text
@@ -124,7 +151,7 @@ def _synthesize_one(
     else:
         arrays = _model.generate(**kwargs)
 
-    return _ndarray_to_b64_wav(arrays[0])
+    return _ndarray_to_b64_wav(arrays[0], _sample_rate)
 
 
 @app.get("/health")
@@ -149,10 +176,21 @@ async def predict(request: PredictRequest):
         override_audio = instance.get("ref_audio", "")
         override_text = instance.get("ref_text", "")
 
-        # Generation tuning from request.parameters (applies to all instances).
-        num_step: int = request.parameters.get("num_step", 32)
-        speed: float = request.parameters.get("speed", 1.0)
-        duration: float | None = request.parameters.get("duration")
+        # Generation tuning. The client has always sent "decoding_steps" inside
+        # the instance while this read "num_step" from parameters, so every
+        # request silently ran the default. Accept both spellings, per instance
+        # first, and fall back to the parameters block for batch-wide settings.
+        num_step = int(
+            instance.get("num_step")
+            or instance.get("decoding_steps")
+            or request.parameters.get("num_step")
+            or request.parameters.get("decoding_steps")
+            or DEFAULT_NUM_STEP
+        )
+        speed: float = float(
+            instance.get("speed") or request.parameters.get("speed") or 1.0
+        )
+        duration: float | None = instance.get("duration") or request.parameters.get("duration")
 
         audio_b64 = await loop.run_in_executor(
             None,

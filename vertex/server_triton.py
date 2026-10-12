@@ -1,6 +1,6 @@
 """Vertex AI prediction server for OmniVoice using omnivoice-triton.
 
-Endpoint contract (matches csm_tts.py client):
+Endpoint contract (matches the app/tts/omnivoice.py client):
   POST /predict
     request:  {"instances": [{"text": "...", "decoding_steps": 8}, ...]}
     response: {"predictions": [{"audio": "<base64-wav>"}, ...]}

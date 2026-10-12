@@ -8,6 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+# Generated audio
 audio/
-scripts/
+scripts/*.wav
+
+# NOT scripts/ itself, which was ignored wholesale. That quietly kept three
+# things out of the repo that the project needs: bench_tts.py (documented in
+# the README), samples/voices.json (the mood -> reference clip map), and the
+# reference clips both serving images COPY at build time -- 1.2 MB of public
+# domain audio, without which a fresh clone cannot build either image.
+
 .env
